@@ -1,0 +1,26 @@
+# inventory.yaml — manual node list (optional when CLUSTER_HOSTS_FILE is set in cluster.env)
+#
+# When CLUSTER_HOSTS_FILE=/etc/hosts is set, this file is ignored completely.
+# Only needed if you prefer an explicit list over auto-discovery from /etc/hosts.
+#
+# Replace the example IPs below with your actual node IPs.
+# "master" must be in group [control]; worker nodes in group [compute].
+nodes:
+  - name: master
+    host: 192.168.1.10    # replace with your master node IP
+    user: hpc             # SSH username (same as CLUSTER_USER in cluster.env)
+    port: 22
+    groups: [control]
+
+  - name: node1
+    host: 192.168.1.11    # replace with your node1 IP
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  # Add more nodes here:
+  # - name: node2
+  #   host: 192.168.1.12
+  #   user: hpc
+  #   port: 22
+  #   groups: [compute]

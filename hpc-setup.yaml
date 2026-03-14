@@ -1,0 +1,143 @@
+steps:
+  # ── Hostname resolution ──────────────────────────────────────────────────────
+  # Must run first so every node can reach every other node by name.
+  # Add a line here for each new node before running on a new cluster.
+  - name: "sync cluster hosts"
+    command: "{{hosts_sync_cmds}}"
+    sudo: true
+
+  # ── SSH key distribution ──────────────────────────────────────────────────────
+  # Pushes master's public key to every node's authorized_keys.
+  # Uses {{master_pubkey}} — resolved at runtime from ~/.ssh/id_ed25519.pub.
+  # Hash = SHA256(node + step + expanded_command), so if master's key ever
+  # rotates this step re-runs on all nodes automatically on the next playbook run.
+  # Runs concurrently on all nodes with no dependencies.
+  - name: "push master ssh key"
+    command: >-
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh &&
+      grep -qxF '{{master_pubkey}}' ~/.ssh/authorized_keys 2>/dev/null
+      || printf '%s\n' '{{master_pubkey}}' >> ~/.ssh/authorized_keys &&
+      chmod 600 ~/.ssh/authorized_keys
+    sudo: false
+
+  # ── Stop background apt so it doesn't fight us for the dpkg lock ────────────
+  - name: "disable unattended-upgrades"
+    command: >-
+      systemctl stop unattended-upgrades 2>/dev/null || true ;
+      systemctl disable unattended-upgrades 2>/dev/null || true ;
+      systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    sudo: true
+    depends_on: ["sync cluster hosts"]
+
+  # ── Base apt (all nodes, fully independent — runs concurrently per node) ─────
+  - name: "apt update"
+    command: "apt-get update -qq"
+    sudo: true
+    depends_on: ["disable unattended-upgrades"]
+
+  - name: "apt full-upgrade"
+    command: "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -qq"
+    sudo: true
+    depends_on: ["apt update"]
+
+  # ── Install everything in one apt call per role (avoids repeated lock grabs) ─
+  # All three install steps run concurrently: master does its apt while node1
+  # does its own apt simultaneously — each node only serializes its own steps.
+
+  - name: "install compute packages"
+    command: >-
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq
+      build-essential openmpi-bin libopenmpi-dev
+      python3 python3-mpi4py python3-numpy python3-pil
+      rsync openssh-server
+    sudo: true
+    depends_on: ["apt full-upgrade"]
+
+  - name: "install nfs server packages"
+    command: "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server"
+    sudo: true
+    roles: [control]
+    depends_on: ["apt full-upgrade"]
+    # Runs concurrently with "install compute packages" on master's own goroutine —
+    # but since master runs steps in order, it does compute packages first, then this.
+    # On other nodes this step is skipped immediately (role mismatch).
+
+  - name: "install nfs client packages"
+    command: "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-common"
+    sudo: true
+    roles: [compute]
+    depends_on: ["apt full-upgrade"]
+    # Worker nodes run this concurrently while master sets up the NFS server.
+
+  # ── NFS server setup (master only) ───────────────────────────────────────────
+  - name: "create nfs shared directory"
+    command: "mkdir -p /srv/cluster_shared && chown hpc:hpc /srv/cluster_shared && chmod 755 /srv/cluster_shared"
+    sudo: true
+    roles: [control]
+    depends_on: ["install nfs server packages"]
+
+  - name: "configure nfs export"
+    command: >-
+      grep -qxF '/srv/cluster_shared 172.16.12.0/24(rw,sync,no_subtree_check,no_root_squash)' /etc/exports
+      || echo '/srv/cluster_shared 172.16.12.0/24(rw,sync,no_subtree_check,no_root_squash)' >> /etc/exports
+    sudo: true
+    roles: [control]
+    depends_on: ["create nfs shared directory"]
+
+  - name: "apply nfs exports"
+    command: "exportfs -ra && systemctl restart nfs-server && systemctl enable nfs-server"
+    sudo: true
+    roles: [control]
+    depends_on: ["configure nfs export"]
+    # When this step's channel closes, worker nodes unblock and proceed to mount.
+
+  # ── NFS client mount (workers) ────────────────────────────────────────────────
+  # depends_on BOTH: master must have exported, AND this node must have nfs-common.
+  - name: "create nfs mount point"
+    command: "mkdir -p /srv/cluster_shared"
+    sudo: true
+    roles: [compute]
+    depends_on: ["install nfs client packages"]
+
+  - name: "add nfs fstab entry"
+    command: >-
+      grep -qxF 'master:/srv/cluster_shared /srv/cluster_shared nfs defaults,noatime 0 0' /etc/fstab
+      || echo 'master:/srv/cluster_shared /srv/cluster_shared nfs defaults,noatime 0 0' >> /etc/fstab
+    sudo: true
+    roles: [compute]
+    depends_on: ["create nfs mount point"]
+
+  - name: "mount nfs share"
+    command: "mountpoint -q /srv/cluster_shared || mount -t nfs master:/srv/cluster_shared /srv/cluster_shared"
+    sudo: true
+    roles: [compute]
+    depends_on: ["apply nfs exports", "add nfs fstab entry"]
+    # This is the key cross-node dependency: workers wait for master to finish
+    # "apply nfs exports" while doing their own preparation in parallel.
+
+  # ── SSH server (all nodes) ────────────────────────────────────────────────────
+  - name: "enable ssh"
+    command: "systemctl enable ssh && systemctl start ssh"
+    sudo: true
+    depends_on: ["install compute packages"]
+
+  # ── MPI hostfile (master only) ────────────────────────────────────────────────
+  - name: "create mpi hostfile"
+    command: >-
+      grep -qF 'master slots=' ~/mpi_hosts 2>/dev/null
+      || printf 'master slots=10\nnode1 slots=10\n' > ~/mpi_hosts
+    sudo: false
+    roles: [control]
+    depends_on: ["install compute packages"]
+
+  # ── Local tmp dirs (all nodes) ────────────────────────────────────────────────
+  - name: "create local tmp dirs"
+    command: "mkdir -p /tmp/img /tmp/out_serial /tmp/out_mpi"
+    sudo: false
+    depends_on: ["install compute packages"]
+
+  # ── Smoke test (all nodes) ────────────────────────────────────────────────────
+  - name: "smoke test"
+    command: "hostname && nproc && mpirun --version | head -1 && python3 -c 'import mpi4py; print(\"mpi4py ok\")'"
+    sudo: false
+    depends_on: ["create local tmp dirs"]

@@ -1,0 +1,33 @@
+# ── Sensitive config (NEVER commit) ───────────────────────────────────────────
+cluster.env
+*.env
+
+# ── Runtime state and logs ────────────────────────────────────────────────────
+.cexec_state.json
+.cexec_state.json.tmp
+logs/
+
+# ── Compiled binaries ─────────────────────────────────────────────────────────
+/cexec
+/cexec-linux-amd64
+cexec-linux-arm64
+cexec-darwin-amd64
+cexec-darwin-arm64
+cexec-windows-amd64.exe
+*.exe
+
+# ── Go toolchain ──────────────────────────────────────────────────────────────
+vendor/
+
+# ── Editor / OS artifacts ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Temp files ────────────────────────────────────────────────────────────────
+*.tmp
+*.bak
