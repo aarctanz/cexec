@@ -78,8 +78,8 @@ steps:
 
   - name: "configure nfs export"
     command: >-
-      grep -qxF '/srv/cluster_shared 172.16.12.0/24(rw,sync,no_subtree_check,no_root_squash)' /etc/exports
-      || echo '/srv/cluster_shared 172.16.12.0/24(rw,sync,no_subtree_check,no_root_squash)' >> /etc/exports
+      grep -qxF '/srv/cluster_shared YOUR_SUBNET/24(rw,sync,no_subtree_check,no_root_squash)' /etc/exports
+      || echo '/srv/cluster_shared YOUR_SUBNET/24(rw,sync,no_subtree_check,no_root_squash)' >> /etc/exports
     sudo: true
     roles: [control]
     depends_on: ["create nfs shared directory"]

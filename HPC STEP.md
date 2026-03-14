@@ -21,9 +21,9 @@ Three Debian 12 machines were used.
 
 Example IP layout used during experiments:
 
-master  172.16.12.34  
-node1   172.16.12.207  
-node2   172.16.12.70
+master  192.168.1.10  
+node1   192.168.1.11  
+node2   192.168.1.12
 
 All machines used the same username.
 
@@ -63,9 +63,9 @@ sudo nano /etc/hosts
 Add entries:
 
 127.0.0.1 localhost  
-172.16.12.34 master  
-172.16.12.207 node1  
-172.16.12.70 node2
+192.168.1.10 master  
+192.168.1.11 node1  
+192.168.1.12 node2
 
 Verify:
 
@@ -125,7 +125,7 @@ sudo chmod 755 /srv/cluster\_shared
 
 Export directory:
 
-echo "/srv/cluster\_shared 172.16.12.0/24(rw,sync,no\_subtree\_check,no\_root\_squash)" \\  
+echo "/srv/cluster\_shared YOUR_SUBNET/24(rw,sync,no\_subtree\_check,no\_root\_squash)" \\  
 | sudo tee \-a /etc/exports
 
 Apply exports:

@@ -1922,7 +1922,7 @@ That's it. Everything else is optional.
 
 Example without cluster.env (everything as flags):
 ```bash
-CLUSTER_PASSWORD=spring ./cexec --auto-hosts /etc/hosts --playbook hpc-setup.yaml
+CLUSTER_PASSWORD=yourpassword ./cexec --auto-hosts /etc/hosts --playbook hpc-setup.yaml
 ```
 Example with cluster.env (just this):
 ```bash
