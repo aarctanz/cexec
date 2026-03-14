@@ -29,11 +29,24 @@ steps:
     sudo: true
     depends_on: ["sync cluster hosts"]
 
+  # ── Wait for any background apt/dpkg process to release its lock ─────────────
+  # Ubuntu 24.04 runs unattended-upgrades aggressively on fresh nodes. Even after
+  # stopping the service the lock may be held for a few more seconds. This polls
+  # until all locks are free before proceeding, preventing exit=100 failures.
+  - name: "wait for apt lock"
+    command: >-
+      timeout 120 bash -c
+      'while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+      /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null;
+      do echo "waiting for apt lock..."; sleep 3; done' || true
+    sudo: true
+    depends_on: ["disable unattended-upgrades"]
+
   # ── Base apt (all nodes, fully independent — runs concurrently per node) ─────
   - name: "apt update"
     command: "apt-get update -qq"
     sudo: true
-    depends_on: ["disable unattended-upgrades"]
+    depends_on: ["wait for apt lock"]
 
   - name: "apt full-upgrade"
     command: "DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -qq"

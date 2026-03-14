@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -62,7 +63,7 @@ func main() {
 	logDir        := flag.String("log-dir", envDefault("CLUSTER_LOG_DIR", "logs"), "Directory for JSON run logs")
 	dryRun        := flag.Bool("dry-run", false, "Show targeted nodes without executing")
 	quiet         := flag.Bool("quiet", false, "Suppress per-node output (only show summary)")
-	playbookPath  := flag.String("playbook", os.Getenv("CLUSTER_PLAYBOOK"), "Path to YAML playbook file (runs multi-step setup)")
+	playbookPath  := flag.String("playbook", "", "Path to YAML playbook file (runs multi-step setup)")
 	stateFile     := flag.String("state-file", envDefault("CLUSTER_STATE_FILE", ".cexec_state.json"), "Path to state file for skip-if-done tracking")
 	forceRun      := flag.Bool("force", false, "Ignore cached state and re-run all steps")
 
@@ -84,6 +85,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  cexec --nodes compute --exclude node03 -- apt update\n")
 	}
 	flag.Parse()
+
+	// CLUSTER_PLAYBOOK env default only kicks in when no explicit --playbook flag
+	// AND no -- command was given. A bare command always wins over the env default.
+	if *playbookPath == "" && len(flag.Args()) == 0 {
+		if v := os.Getenv("CLUSTER_PLAYBOOK"); v != "" {
+			*playbookPath = v
+		}
+	}
 
 	// Re-load env file if --env-file was explicitly changed by the user.
 	if *envFile != envFileFlag {
@@ -374,15 +383,10 @@ func runPlaybook(
 		}
 	}
 
-	// signalDone decrements the pending counter for step i; closes the channel
-	// when it hits zero, unblocking any goroutine waiting in depends_on.
-	var pendingMu sync.Mutex
+	// signalDone atomically decrements the pending counter for step i and closes
+	// the channel when it reaches zero, unblocking depends_on waiters.
 	signalDone := func(i int) {
-		pendingMu.Lock()
-		pending[i]--
-		remaining := pending[i]
-		pendingMu.Unlock()
-		if remaining == 0 {
+		if atomic.AddInt32(&pending[i], -1) == 0 {
 			close(signals[i])
 		}
 	}
@@ -728,10 +732,14 @@ func buildHostsSyncCmds(hostsFile string) string {
 		}
 		for _, name := range fields[1:] {
 			if hosts.IsClusterHost(strings.ToLower(name)) {
-				// Shell-safe: public IPs and hostnames won't have special chars.
+				// Normalize to single space so the grep never misses due to
+				// tab/multi-space differences in the original /etc/hosts file.
+				// Use -E regex to match any whitespace between IP and hostname,
+				// preventing duplicates regardless of the source file's formatting.
+				normalized := fields[0] + " " + strings.ToLower(name)
 				cmds = append(cmds, fmt.Sprintf(
-					`grep -qxF %q /etc/hosts 2>/dev/null || echo %q >> /etc/hosts`,
-					line, line,
+					`grep -qE "^%s[[:space:]]+%s([[:space:]]|$)" /etc/hosts 2>/dev/null || echo %q >> /etc/hosts`,
+					fields[0], strings.ToLower(name), normalized,
 				))
 				break
 			}

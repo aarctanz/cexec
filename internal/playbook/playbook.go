@@ -54,6 +54,44 @@ func Load(path string) (*Playbook, error) {
 			}
 		}
 	}
+
+	// Detect dependency cycles using depth-first search.
+	// A cycle (A depends_on B depends_on A) would cause all goroutines to
+	// block forever — catch it here at load time with a clear error message.
+	type mark int
+	const (
+		unvisited mark = iota
+		inProgress
+		visited
+	)
+	state := make(map[string]mark, len(pb.Steps))
+	deps := make(map[string][]string, len(pb.Steps))
+	for _, s := range pb.Steps {
+		deps[s.Name] = s.DependsOn
+	}
+	var dfs func(name string) error
+	dfs = func(name string) error {
+		switch state[name] {
+		case inProgress:
+			return fmt.Errorf("dependency cycle detected involving step %q", name)
+		case visited:
+			return nil
+		}
+		state[name] = inProgress
+		for _, dep := range deps[name] {
+			if err := dfs(dep); err != nil {
+				return err
+			}
+		}
+		state[name] = visited
+		return nil
+	}
+	for _, s := range pb.Steps {
+		if err := dfs(s.Name); err != nil {
+			return nil, err
+		}
+	}
+
 	if len(pb.Steps) == 0 {
 		return nil, fmt.Errorf("playbook %s has no steps", path)
 	}
