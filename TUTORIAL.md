@@ -400,17 +400,17 @@ You started with `master` and `node1`. Your cluster is growing. You now have 18 
 
 ### Step 1: Add New Nodes to /etc/hosts
 
-```
-# /etc/hosts
-192.168.1.10   master
-192.168.1.11   node1
-192.168.1.12   node2
-192.168.1.13   node3
-...
-192.168.1.29   node19
+```bash
+echo '192.168.1.12   node2' | sudo tee -a /etc/hosts
+echo '192.168.1.13   node3' | sudo tee -a /etc/hosts
+# ... repeat for each new node up to node19
 ```
 
-That is all. No inventory files to update. No configuration to change. cexec re-reads `CLUSTER_HOSTS_FILE` on every run, so it automatically discovers the new nodes.
+No inventory files to update manually. On the next cexec run, any node found in `/etc/hosts` but not in `inventory.yaml` is auto-appended to `inventory.yaml` with group `[compute]` (or `[control]` for master). You will see a line like:
+
+```
+Info: synced node2 (192.168.1.12) → inventory.yaml  [groups: compute]
+```
 
 ### Step 2: Verify Connectivity to New Nodes
 
@@ -742,18 +742,20 @@ If `control-only-step` only runs on `control` nodes, then `app-step` on compute 
 
 ### How Groups Are Assigned
 
-When cexec reads `CLUSTER_HOSTS_FILE`, it applies simple rules:
+Groups come from `inventory.yaml`. When a node is discovered in `/etc/hosts` but not yet in `inventory.yaml`, cexec auto-adds it with a default group:
 
-- A line containing the hostname `master` → assigned to the `control` group.
-- Lines containing `node1`, `node2`, `node3`, etc. → assigned to the `compute` group.
+- `master` → `[control]`
+- `node1`, `node2`, `node3`, etc. → `[compute]`
 
 ```
-192.168.1.10   master     ← control group
-192.168.1.11   node1      ← compute group
-192.168.1.12   node2      ← compute group
+/etc/hosts                         inventory.yaml (auto-maintained)
+──────────────────────────         ──────────────────────────────────
+192.168.1.10   master         →    groups: [control]
+192.168.1.11   node1          →    groups: [compute]
+192.168.1.12   node2          →    groups: [compute]
 ```
 
-No other configuration is needed. The inventory is derived automatically from the hosts file.
+To override a group (e.g. a dedicated storage node), edit `inventory.yaml` directly after the auto-add and change its `groups` field. cexec will not overwrite manual group changes.
 
 ### Steps That Run Everywhere (No roles field)
 

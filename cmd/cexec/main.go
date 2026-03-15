@@ -48,9 +48,10 @@ func main() {
 	}
 
 	// --- Flags (env file values are now in os.Getenv, used as defaults) ------
-	inventoryPath := flag.String("inventory", "inventory.yaml", "Path to inventory YAML file (unused when --auto-hosts or CLUSTER_HOSTS_FILE is set)")
-	autoHosts     := flag.String("auto-hosts", os.Getenv("CLUSTER_HOSTS_FILE"), "Auto-build inventory from this hosts file — defaults to CLUSTER_HOSTS_FILE in cluster.env")
-	hostsUser     := flag.String("hosts-user", envDefault("CLUSTER_USER", "hpc"), "SSH user when using --auto-hosts")
+	inventoryPath := flag.String("inventory", "inventory.yaml", "Path to inventory YAML file")
+	autoHosts     := flag.String("auto-hosts", os.Getenv("CLUSTER_HOSTS_FILE"), "Primary IP source: hosts file to read (defaults to CLUSTER_HOSTS_FILE in cluster.env)")
+	hostsUser     := flag.String("hosts-user", envDefault("CLUSTER_USER", "hpc"), "SSH user for nodes discovered via --auto-hosts")
+	useInventory  := flag.Bool("use-inventory", false, "Force inventory.yaml even when --auto-hosts / CLUSTER_HOSTS_FILE is set")
 	envFile       := flag.String("env-file", envFileFlag, "Path to cluster.env file (KEY=VALUE, # comments)")
 	selector      := flag.String("nodes", "all", "Target selector: 'all', group name, or comma-separated node names")
 	exclude       := flag.String("exclude", "", "Comma-separated node names to exclude")
@@ -74,15 +75,22 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\ncluster.env keys (loaded automatically if present):\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_PASSWORD    SSH + sudo password for all nodes\n")
-		fmt.Fprintf(os.Stderr, "  CLUSTER_HOSTS_FILE  Hosts file for auto-inventory (e.g. /etc/hosts)\n")
+		fmt.Fprintf(os.Stderr, "  CLUSTER_HOSTS_FILE  Primary IP source (e.g. /etc/hosts); syncs new nodes into inventory.yaml\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_USER        SSH user (default: hpc)\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_PLAYBOOK    Default playbook path\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_LOG_DIR     Log directory (default: logs)\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_STATE_FILE  State file path (default: .cexec_state.json)\n")
+		fmt.Fprintf(os.Stderr, "\nInventory modes:\n")
+		fmt.Fprintf(os.Stderr, "  CLUSTER_HOSTS_FILE set, no --use-inventory\n")
+		fmt.Fprintf(os.Stderr, "    → /etc/hosts is the IP source; inventory.yaml provides groups.\n")
+		fmt.Fprintf(os.Stderr, "      New nodes found in /etc/hosts are auto-added to inventory.yaml.\n")
+		fmt.Fprintf(os.Stderr, "  --use-inventory  (or CLUSTER_HOSTS_FILE unset)\n")
+		fmt.Fprintf(os.Stderr, "    → inventory.yaml is the sole source. Groups + IPs must be defined there.\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  cexec --playbook hpc-setup.yaml          # uses cluster.env for everything\n")
-		fmt.Fprintf(os.Stderr, "  cexec --auto-hosts /etc/hosts -- hostname\n")
-		fmt.Fprintf(os.Stderr, "  cexec --nodes compute --exclude node03 -- apt update\n")
+		fmt.Fprintf(os.Stderr, "  cexec --playbook hpc-setup.yaml           # uses cluster.env for everything\n")
+		fmt.Fprintf(os.Stderr, "  cexec --auto-hosts /etc/hosts -- hostname # one-off with explicit hosts file\n")
+		fmt.Fprintf(os.Stderr, "  cexec --use-inventory --nodes compute -- uptime\n")
+		fmt.Fprintf(os.Stderr, "  cexec --nodes compute --exclude node3 -- apt update\n")
 	}
 	flag.Parse()
 
@@ -119,20 +127,74 @@ func main() {
 	}()
 
 	// --- Load inventory -------------------------------------------------------
-	// Priority: --auto-hosts flag > CLUSTER_HOSTS_FILE in .env > inventory.yaml
+	// Modes (in priority order):
+	//   1. --auto-hosts / CLUSTER_HOSTS_FILE set AND --use-inventory not passed
+	//      → /etc/hosts is the primary IP source. inventory.yaml is overlaid for
+	//        group/port/user metadata. New nodes found in /etc/hosts are appended
+	//        to inventory.yaml automatically. Nodes in inventory.yaml but absent
+	//        from /etc/hosts are included (using their stored IP) with a warning.
+	//   2. --use-inventory passed, OR CLUSTER_HOSTS_FILE unset
+	//      → inventory.yaml is the source. If --auto-hosts is also set, warn about
+	//        inventory nodes that are missing from the hosts file.
 	var inv *inventory.Inventory
 	var err error
-	if *autoHosts != "" {
-		inv, err = hosts.LoadInventory(*autoHosts, *hostsUser, 22)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error (auto-hosts): %v\n", err)
+
+	useHostsFile := *autoHosts != "" && !*useInventory
+	if useHostsFile {
+		hostsInv, herr := hosts.LoadInventory(*autoHosts, *hostsUser, 22)
+		if herr != nil {
+			fmt.Fprintf(os.Stderr, "Error (auto-hosts): %v\n", herr)
 			os.Exit(1)
+		}
+		// Overlay group metadata from inventory.yaml (best-effort — file may not exist yet).
+		if invOverlay, oerr := inventory.Load(*inventoryPath); oerr == nil {
+			merged, addedToInv, missingFromHosts := inventory.MergeGroups(hostsInv, invOverlay)
+			inv = merged
+			// Auto-persist new /etc/hosts nodes into inventory.yaml.
+			if len(addedToInv) > 0 {
+				for _, n := range addedToInv {
+					invOverlay.Nodes = append(invOverlay.Nodes, n)
+				}
+				if serr := inventory.Save(*inventoryPath, invOverlay); serr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not update %s: %v\n", *inventoryPath, serr)
+				} else {
+					for _, n := range addedToInv {
+						fmt.Printf("Info: synced %-8s (%s) → %s  [groups: %s]\n",
+							n.Name, n.Host, *inventoryPath, strings.Join(n.Groups, ","))
+					}
+				}
+			}
+			// Warn about inventory nodes absent from /etc/hosts (still usable via stored IP).
+			for _, n := range missingFromHosts {
+				fmt.Fprintf(os.Stderr, "Warning: %s is in %s but missing from %s — "+
+					"to add:  echo '%s    %s' | sudo tee -a %s\n",
+					n.Name, *inventoryPath, *autoHosts, n.Host, n.Name, *autoHosts)
+			}
+		} else {
+			// No inventory.yaml yet — use hosts-only result with default groups.
+			inv = hostsInv
 		}
 	} else {
 		inv, err = inventory.Load(*inventoryPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
+		}
+		// If a hosts file is known, warn about inventory nodes missing from it.
+		if *autoHosts != "" {
+			if hostsInv, herr := hosts.LoadInventory(*autoHosts, *hostsUser, 22); herr == nil {
+				hostsSet := make(map[string]bool, len(hostsInv.Nodes))
+				for _, n := range hostsInv.Nodes {
+					hostsSet[n.Name] = true
+				}
+				for _, n := range inv.Nodes {
+					if !hostsSet[n.Name] {
+						fmt.Fprintf(os.Stderr, "Warning: %s is in %s but missing from %s — "+
+							"to add:  echo '%s    %s' | sudo tee -a %s\n",
+							n.Name, *inventoryPath, *autoHosts, n.Host, n.Name, *autoHosts)
+					}
+				}
+			}
 		}
 	}
 

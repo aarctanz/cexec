@@ -368,11 +368,14 @@ CLUSTER_STATE_FILE=.cexec_state.json
 
 ## Setting Up Your Inventory (Node List)
 
-An "inventory" is just the list of servers cexec should connect to. There are two ways to provide it.
+An "inventory" is the list of servers cexec should connect to. cexec uses two sources together — `/etc/hosts` for IPs and `inventory.yaml` for group metadata — and keeps them in sync automatically.
 
-### Option A — Auto-Inventory from /etc/hosts (Recommended)
+### Default Mode — /etc/hosts as Primary (Recommended)
 
-Set `CLUSTER_HOSTS_FILE=/etc/hosts` in your `cluster.env`. cexec will read that file and automatically pick up any entry whose hostname matches the pattern `master`, `node1`, `node2`, ..., `node20`, etc.
+Set `CLUSTER_HOSTS_FILE=/etc/hosts` in `cluster.env`. cexec reads IPs from there and overlays group assignments from `inventory.yaml`. The two sources are kept in sync:
+
+- **New node in `/etc/hosts` but not `inventory.yaml`** → auto-appended to `inventory.yaml` with default groups (`master` → `control`, all others → `compute`).
+- **Node in `inventory.yaml` but not `/etc/hosts`** → warning printed with the exact line to add.
 
 Example `/etc/hosts` on your master machine:
 
@@ -381,23 +384,17 @@ Example `/etc/hosts` on your master machine:
 192.168.1.10    master
 192.168.1.11    node1
 192.168.1.12    node2
-192.168.1.13    node3
-192.168.1.14    node4
 ```
 
-cexec discovers: `master` (assigned group: `control`), `node1` through `node4` (assigned group: `compute`). No other config needed.
+cexec discovers `master` (group: `control`) and `node1`, `node2` (group: `compute`). If these nodes are not yet in `inventory.yaml`, they are added automatically on the next run.
 
-**Why this is recommended:** You probably already keep your `/etc/hosts` up-to-date with your cluster layout. Using it as the source of truth means you do not have a separate inventory file to maintain. Adding a new node is as simple as adding a line to `/etc/hosts`.
+**Adding a new node** is a two-step process:
+1. Add it to master's `/etc/hosts`: `echo '192.168.1.13  node3' | sudo tee -a /etc/hosts`
+2. Run any cexec command — node3 is auto-added to `inventory.yaml` with group `[compute]`.
 
-You can also pass it directly as a flag without setting it in `cluster.env`:
+### inventory.yaml — Group Metadata and Fallback
 
-```bash
-./cexec --auto-hosts /etc/hosts --hosts-user hpc -- hostname
-```
-
-### Option B — Manual inventory.yaml
-
-Create an `inventory.yaml` file:
+`inventory.yaml` stores group assignments, per-node port overrides, and per-node user overrides. It is the only place to define non-default groups:
 
 ```yaml
 nodes:
@@ -412,24 +409,16 @@ nodes:
     user: hpc
     port: 22
     groups: [compute]
-
-  - name: node2
-    host: 192.168.1.12
-    user: hpc
-    port: 22
-    groups: [compute]
-
-  - name: node3
-    host: 192.168.1.13
-    user: hpc
-    port: 22
-    groups: [compute]
 ```
 
-Then run with:
+When `CLUSTER_HOSTS_FILE` is set, the `host` field here is ignored (IP comes from `/etc/hosts`). Groups, port, and user are always read from `inventory.yaml`.
+
+### Fallback Mode — inventory.yaml Only
+
+If `CLUSTER_HOSTS_FILE` is unset, or you pass `--use-inventory`, cexec reads only `inventory.yaml`. This is the fallback for when `/etc/hosts` is unavailable or broken:
 
 ```bash
-./cexec --inventory inventory.yaml --playbook hpc-setup.yaml
+./cexec --use-inventory --playbook hpc-setup.yaml
 ```
 
 ### Node Fields Explained
@@ -919,9 +908,10 @@ Example log entry for a single node's step:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--inventory` | `inventory.yaml` | Path to the manual inventory YAML file |
-| `--auto-hosts` | — | Path to a hosts file to auto-build inventory from |
-| `--hosts-user` | `hpc` | SSH user to assign when using `--auto-hosts` |
+| `--inventory` | `inventory.yaml` | Path to the inventory YAML file (group metadata + fallback IPs) |
+| `--auto-hosts` | — | Primary IP source: path to a hosts file (defaults to `CLUSTER_HOSTS_FILE`) |
+| `--hosts-user` | `hpc` | SSH user for nodes discovered via `--auto-hosts` |
+| `--use-inventory` | `false` | Force `inventory.yaml` as sole source even when `CLUSTER_HOSTS_FILE` is set |
 | `--nodes` | `all` | Target: `all`, a group name, or comma-separated node names (e.g. `master,node2`) |
 | `--exclude` | — | Comma-separated node names to exclude from the run |
 
@@ -948,13 +938,10 @@ Example log entry for a single node's step:
 
 ## Adding More Nodes Later
 
-Adding a new server to your cluster requires zero changes to cexec config. Just:
+**Step 1 — Add the new node to `/etc/hosts` on master:**
 
-**Step 1 — Add the new node to `/etc/hosts` on the master:**
-
-```
-192.168.1.15   node5
-192.168.1.16   node6
+```bash
+echo '192.168.1.15   node5' | sudo tee -a /etc/hosts
 ```
 
 **Step 2 — Re-run the playbook:**
@@ -966,9 +953,10 @@ Adding a new server to your cluster requires zero changes to cexec config. Just:
 **What happens automatically:**
 
 - `node1` through `node4` — every step is skipped instantly (already in the cache)
-- `node5` and `node6` — every step runs fresh from the beginning (new nodes, not in cache)
+- `node5` — every step runs fresh (new node, not in cache)
+- `node5` is auto-appended to `inventory.yaml` with group `[compute]`
 
-You do not need to touch any config files, inventory files, or the cache file. cexec handles it.
+If you need a non-default group (e.g. a storage node), add the node to `/etc/hosts` first, let cexec auto-append it to `inventory.yaml`, then edit the group in `inventory.yaml` manually.
 
 ---
 
