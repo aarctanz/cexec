@@ -549,11 +549,26 @@ You can also swap flag order freely:
 # Only run on the master (nodes in the "control" group)
 ./cexec --nodes control -- systemctl status nfs-server
 
-# Run on specific named nodes
+# Multiple groups at once
+./cexec --nodes compute,control -- uptime
+
+# Specific named nodes
 ./cexec --nodes master,node2 -- systemctl restart nginx
 
-# Run on all nodes EXCEPT node3
+# Range of nodes (node3, node4, node5)
+./cexec --nodes node3-node5 -- reboot
+
+# Mixed: a group plus a range plus individual nodes
+./cexec --nodes control,node3-node5,node8 -- hostname
+
+# Exclude a single node
 ./cexec --exclude node3 -- reboot
+
+# Exclude a range
+./cexec --nodes compute --exclude node3-node5 -- apt-get upgrade -y
+
+# Exclude multiple ranges
+./cexec --exclude node3-node5,node8-node9 -- reboot
 
 # Target a group in a playbook
 ./cexec --nodes compute --playbook worker-setup.yaml
@@ -967,8 +982,8 @@ Example log entry for a single node's step:
 | `--auto-hosts` | — | Primary IP source: path to a hosts file (defaults to `CLUSTER_HOSTS_FILE`) |
 | `--hosts-user` | `hpc` | SSH user for nodes discovered via `--auto-hosts` |
 | `--use-inventory` | `false` | Force `inventory.yaml` as sole source even when `CLUSTER_HOSTS_FILE` is set |
-| `--nodes` | `all` | Target: `all`, a group name, or comma-separated node names (e.g. `master,node2`) |
-| `--exclude` | — | Comma-separated node names to exclude from the run |
+| `--nodes` | `all` | Target selector — `all`, group name(s), node name(s), or ranges. Comma-separated, mixed freely (e.g. `compute,control`, `node3-node5`, `gpu,node8-node9,master`) |
+| `--exclude` | — | Nodes to exclude — same syntax as `--nodes`: comma-separated names and/or ranges (e.g. `node3`, `node3-node5`, `node3-node5,node8`) |
 
 ### SSH and Execution Flags
 

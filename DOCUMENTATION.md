@@ -562,25 +562,33 @@ Applies defaults after unmarshalling:
 #### Select
 
 ```go
-func Select(inv []Node, selector string, exclude []string) []Node
+func Select(inv *Inventory, selector string, exclude string) ([]Node, error)
 ```
 
-**Selector logic**:
+**Selector logic** — each comma-separated token is tried as a group name first,
+then as a node name. Ranges are expanded before matching:
 
 | Selector value | Behavior |
 |---------------|----------|
-| `"all"` or `""` | Returns all nodes |
-| A group name (e.g., `"compute"`) | Returns nodes where `node.Groups` contains that group |
-| Comma-separated names (e.g., `"node1,node2"`) | Returns nodes whose `Name` is in the list |
-| A single node name (e.g., `"master"`) | Returns the one matching node |
+| `"all"` | Returns all nodes |
+| `"compute"` | Returns nodes whose `Groups` contains `"compute"` |
+| `"compute,control"` | Returns nodes in either group (deduplicated) |
+| `"node3-node5"` | Expands to node3, node4, node5 (range syntax) |
+| `"node3-5"` | Same — shorthand range (prefix implied) |
+| `"gpu,node3-node5,master"` | Mixed: group + range + single node |
+| `"node1,node2"` | Explicit node name list |
 
-**Exclude logic**: `exclude` is a `[]string` of node names to remove from the result. The function builds an `excludeSet` (map[string]bool) for O(1) lookup, then filters.
+**Exclude logic**: same syntax as selector. `exclude` is expanded and built into
+a `map[string]bool` for O(1) lookup, then filtered from candidates.
+
+**Deduplication**: a node matched by multiple tokens (e.g. in both `compute`
+and `gpu` groups when both are selected) is included exactly once.
 
 Example:
 
 ```
-Select(inv, "compute", []string{"node3"})
-→ all compute nodes except node3
+Select(inv, "compute,control", "node3-node5")
+→ all compute + control nodes, minus node3, node4, node5
 ```
 
 ---
@@ -2109,8 +2117,8 @@ cexec --playbook hpc-setup.yaml
 | `--hosts-user` | `CLUSTER_USER` | `hpc` | SSH user for auto-inventory nodes |
 | `--use-inventory` | — | `false` | Force inventory.yaml even when CLUSTER_HOSTS_FILE is set |
 | `--env-file` | — | `cluster.env` | Path to env file (loaded before flag parsing) |
-| `--nodes` | — | `all` | Node selector: "all", group name, or comma-separated names |
-| `--exclude` | — | — | Comma-separated node names to exclude |
+| `--nodes` | — | `all` | Target selector: `all`, group name(s), node name(s), or ranges — comma-separated, mixed freely (e.g. `compute,control`, `node3-node5`, `gpu,node8-node9`) |
+| `--exclude` | — | — | Nodes to exclude — same syntax as `--nodes`: names and/or ranges (e.g. `node3-node5,node8`) |
 | `--sudo` | — | `false` | Run single command with sudo (use `sudo: true` in playbooks) |
 | `--timeout` | — | `5m` | Per-command timeout |
 | `--concurrency` | — | `0` (unlimited) | Max concurrent SSH connections |
