@@ -3,11 +3,49 @@ package inventory
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// rangeRe matches range tokens like "node3-node5" or "node3-5".
+// Group 1 = prefix ("node"), group 2 = start number, group 3 = end number.
+var rangeRe = regexp.MustCompile(`^([a-zA-Z]+)(\d+)-(?:[a-zA-Z]+)?(\d+)$`)
+
+// expandToken expands a single token into node names.
+// "node3-node5" and "node3-5" both expand to ["node3","node4","node5"].
+// A plain name like "master" or "node7" is returned unchanged.
+func expandToken(token string) []string {
+	token = strings.TrimSpace(token)
+	m := rangeRe.FindStringSubmatch(token)
+	if m == nil {
+		return []string{token}
+	}
+	prefix := m[1]
+	start, _ := strconv.Atoi(m[2])
+	end, _ := strconv.Atoi(m[3])
+	if start > end {
+		start, end = end, start // handle reversed range gracefully
+	}
+	names := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		names = append(names, fmt.Sprintf("%s%d", prefix, i))
+	}
+	return names
+}
+
+// expandList splits a comma-separated string and expands any range tokens.
+// "node3-node5,node8-node9,master" → ["node3","node4","node5","node8","node9","master"]
+func expandList(s string) []string {
+	var result []string
+	for _, token := range strings.Split(s, ",") {
+		result = append(result, expandToken(token)...)
+	}
+	return result
+}
 
 // Save writes the inventory to a YAML file.
 // Existing comments in the file are not preserved — this is a full rewrite.
@@ -111,13 +149,15 @@ func Load(path string) (*Inventory, error) {
 
 // Select returns nodes matching the selector while honouring exclusions.
 //
-//	selector: "all", a group name, or comma-separated node names.
-//	exclude:  comma-separated node names to skip (may be empty).
+//	selector: "all", a group name, comma-separated node names, or ranges
+//	          (e.g. "node3-node5", "node3-5", "node3-node5,node8-node9,master").
+//	exclude:  same syntax as selector — comma-separated names and/or ranges.
 func Select(inv *Inventory, selector string, exclude string) ([]Node, error) {
+	// Build exclude set — supports ranges and comma-separated names.
 	excludeSet := make(map[string]bool)
 	if exclude != "" {
-		for _, n := range strings.Split(exclude, ",") {
-			excludeSet[strings.TrimSpace(n)] = true
+		for _, name := range expandList(exclude) {
+			excludeSet[name] = true
 		}
 	}
 
@@ -127,23 +167,33 @@ func Select(inv *Inventory, selector string, exclude string) ([]Node, error) {
 	case selector == "all":
 		candidates = inv.Nodes
 
-	case containsComma(selector):
-		// Explicit list.
-		wanted := make(map[string]bool)
-		for _, n := range strings.Split(selector, ",") {
-			wanted[strings.TrimSpace(n)] = true
-		}
-		for _, n := range inv.Nodes {
-			if wanted[n.Name] {
-				candidates = append(candidates, n)
-			}
-		}
-
 	default:
-		// Treat as group name.
-		for _, n := range inv.Nodes {
-			if slices.Contains(n.Groups, selector) {
-				candidates = append(candidates, n)
+		expanded := expandList(selector)
+		// If the selector didn't expand (single plain token, no range/comma),
+		// try it as a group name first, then as a single node name.
+		if len(expanded) == 1 && expanded[0] == strings.TrimSpace(selector) {
+			for _, n := range inv.Nodes {
+				if slices.Contains(n.Groups, selector) {
+					candidates = append(candidates, n)
+				}
+			}
+			if len(candidates) == 0 {
+				for _, n := range inv.Nodes {
+					if n.Name == selector {
+						candidates = append(candidates, n)
+					}
+				}
+			}
+		} else {
+			// Multiple names, commas, or a range — treat as explicit node list.
+			wanted := make(map[string]bool, len(expanded))
+			for _, name := range expanded {
+				wanted[name] = true
+			}
+			for _, n := range inv.Nodes {
+				if wanted[n.Name] {
+					candidates = append(candidates, n)
+				}
 			}
 		}
 	}
@@ -160,8 +210,4 @@ func Select(inv *Inventory, selector string, exclude string) ([]Node, error) {
 		return nil, fmt.Errorf("no nodes matched selector %q (exclude: %q)", selector, exclude)
 	}
 	return result, nil
-}
-
-func containsComma(s string) bool {
-	return strings.Contains(s, ",")
 }
