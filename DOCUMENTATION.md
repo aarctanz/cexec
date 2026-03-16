@@ -1418,10 +1418,11 @@ CLUSTER_STATE_FILE=/var/lib/cexec/state.json
 
 ### Available Variables
 
-| Variable | Source | Example Value |
-|----------|--------|--------------|
-| `{{master_pubkey}}` | `~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub` | `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host` |
-| `{{hosts_sync_cmds}}` | Generated from `CLUSTER_HOSTS_FILE` | Long grep-or-echo command chain |
+| Variable | Source | Purpose |
+|----------|--------|---------|
+| `{{master_pubkey}}` | `~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub` | Distribute master's SSH public key to nodes |
+| `{{hosts_sync_cmds}}` | Generated from `CLUSTER_HOSTS_FILE` | Idempotently add missing `/etc/hosts` entries to a node |
+| `{{hosts_content_b64}}` | Full content of `CLUSTER_HOSTS_FILE`, base64-encoded | Completely overwrite a node's `/etc/hosts` with master's copy |
 
 ### master_pubkey Usage
 
@@ -1454,6 +1455,23 @@ grep -qxF '172.16.0.1    master' /etc/hosts 2>/dev/null || echo '172.16.0.1    m
 ```
 
 This runs on ALL cluster nodes (including master itself), ensuring every node has every other node in its `/etc/hosts`. The grep-before-echo pattern makes it safe to run multiple times.
+
+### hosts_content_b64 Usage
+
+```yaml
+- name: "overwrite /etc/hosts from master"
+  command: "echo '{{hosts_content_b64}}' | base64 -d > /etc/hosts"
+  sudo: true
+  roles: [compute]
+```
+
+Expands to the entire content of master's `/etc/hosts`, base64-encoded into a
+single printable string. On the remote node, `base64 -d` decodes it and `>`
+does a full overwrite. Use this when a node's `/etc/hosts` is empty or
+corrupted and needs a hard reset back to master's copy.
+
+`{{hosts_sync_cmds}}` adds only missing entries (safe, incremental).
+`{{hosts_content_b64}}` replaces the entire file (destructive, complete reset).
 
 ### Why Not Use `envsubst` or Go `text/template`?
 
@@ -1518,25 +1536,53 @@ echo 'PASSWORD' | sudo -S sh -c "THE_ACTUAL_COMMAND"
 sudo sh -c "THE_ACTUAL_COMMAND"
 ```
 
-### Per-Node Password Override
+### Password Priority
 
-Main.go password injection (happens after inventory load, before execution):
+Password resolution happens in two places, both using the same priority order:
+
+**1. SSH login** (`node.Password` — set during inventory injection):
 
 ```go
-for i := range nodes {
-    // Check for per-node env var first (e.g., env var named "master" or "node1")
-    if perNodePass := os.Getenv(nodes[i].Name); perNodePass != "" {
-        nodes[i].Password = perNodePass
-    } else if clusterPass != "" {
-        nodes[i].Password = clusterPass
+userPasswords := parseUserPasswords(os.Getenv("CLUSTER_USER_PASSWORDS"))
+for i := range inv.Nodes {
+    n := &inv.Nodes[i]
+    if p := os.Getenv(n.Name); p != "" {          // 1. per-node env var
+        n.Password = p
+    } else if p, ok := userPasswords[n.User]; ok { // 2. CLUSTER_USER_PASSWORDS
+        n.Password = p
+    } else if clusterPassword != "" {              // 3. CLUSTER_PASSWORD
+        n.Password = clusterPassword
     }
 }
 ```
 
-This means:
-- `CLUSTER_PASSWORD=secret cexec ...` → all nodes use "secret"
-- `master=masterpass node1=node1pass cexec ...` → each node uses its own password
-- `CLUSTER_PASSWORD=default master=override cexec ...` → master uses "override", others use "default"
+**2. Sudo** (`sudoPassFn` — called per step execution):
+
+```go
+nodePassMap := // built from already-resolved node.Password values above
+sudoPassFn := func(nodeName string) string {
+    if p := os.Getenv(nodeName); p != "" {     // 1. per-node env var
+        return p
+    }
+    if p, ok := nodePassMap[nodeName]; ok {    // 2. CLUSTER_USER_PASSWORDS (via resolved password)
+        return p
+    }
+    return clusterPassword                     // 3. CLUSTER_PASSWORD
+}
+```
+
+Both SSH login and sudo use the same resolved password. `CLUSTER_USER_PASSWORDS`
+maps SSH usernames to passwords, so different users on different nodes each
+get the right password automatically. `CLUSTER_SUDO_PASS` was removed — it was
+dead, undocumented code superseded by this design.
+
+Priority summary:
+
+| Priority | Source | Scope |
+|---|---|---|
+| 1 (highest) | `export node3=secret` | One specific node |
+| 2 | `CLUSTER_USER_PASSWORDS=hpc:pass,lab1:pass` | Per SSH username |
+| 3 | `CLUSTER_PASSWORD=pass` | All nodes (global fallback) |
 
 ---
 
@@ -2015,7 +2061,13 @@ Create from the template: `cp cluster.env.example cluster.env`
 ```bash
 # cluster.env — values here are defaults; real env vars take precedence
 
-# SSH/sudo password for all nodes (required if not using key auth)
+# Per-user passwords: user1:pass1,user2:pass2
+# Applies to BOTH SSH login and sudo. Higher priority than CLUSTER_PASSWORD.
+# Use this for clusters with multiple SSH usernames (e.g. migration scenarios).
+CLUSTER_USER_PASSWORDS=hpc:yourpassword
+
+# Global fallback SSH/sudo password for all nodes.
+# Only used when a node's username has no entry in CLUSTER_USER_PASSWORDS.
 CLUSTER_PASSWORD=
 
 # Path to /etc/hosts or similar file for auto inventory generation
@@ -2053,14 +2105,14 @@ cexec --playbook hpc-setup.yaml
 |------|---------|---------|-------------|
 | `--playbook` | `CLUSTER_PLAYBOOK` | — | Path to playbook YAML |
 | `--inventory` | — | `inventory.yaml` | Path to manual inventory YAML |
-| `--auto-hosts` | `CLUSTER_HOSTS_FILE` | — | Path to hosts file for auto-inventory |
+| `--auto-hosts` | `CLUSTER_HOSTS_FILE` | — | Path to hosts file for auto-inventory (hybrid mode) |
 | `--hosts-user` | `CLUSTER_USER` | `hpc` | SSH user for auto-inventory nodes |
-| `--env-file` | — | — | Path to env file (loaded before flag parsing) |
+| `--use-inventory` | — | `false` | Force inventory.yaml even when CLUSTER_HOSTS_FILE is set |
+| `--env-file` | — | `cluster.env` | Path to env file (loaded before flag parsing) |
 | `--nodes` | — | `all` | Node selector: "all", group name, or comma-separated names |
 | `--exclude` | — | — | Comma-separated node names to exclude |
-| `--cmd` | — | — | Single command to run (no playbook) |
-| `--sudo` | — | `false` | Run command with sudo |
-| `--timeout` | `CLUSTER_TIMEOUT` | `5m` | Per-command timeout |
+| `--sudo` | — | `false` | Run single command with sudo (use `sudo: true` in playbooks) |
+| `--timeout` | — | `5m` | Per-command timeout |
 | `--concurrency` | — | `0` (unlimited) | Max concurrent SSH connections |
 | `--retries` | — | `0` | Max retry attempts on transient failures |
 | `--backoff` | — | `2s` | Base backoff duration |
@@ -2070,6 +2122,8 @@ cexec --playbook hpc-setup.yaml
 | `--dry-run` | — | `false` | Print what would run without executing |
 | `--force` | — | `false` | Ignore state cache; re-run all steps |
 | `--quiet` | — | `false` | Suppress per-step output (only show summary) |
+| `--stdout` | — | `false` | Save full stdout from every node to `--stdout-dir/<ts>/<node>.log` |
+| `--stdout-dir` | — | `cexec_stdout` | Directory for per-node stdout files |
 
 ### Priority Order
 
