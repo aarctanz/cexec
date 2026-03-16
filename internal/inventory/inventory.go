@@ -168,30 +168,34 @@ func Select(inv *Inventory, selector string, exclude string) ([]Node, error) {
 		candidates = inv.Nodes
 
 	default:
-		expanded := expandList(selector)
-		// If the selector didn't expand (single plain token, no range/comma),
-		// try it as a group name first, then as a single node name.
-		if len(expanded) == 1 && expanded[0] == strings.TrimSpace(selector) {
+		// Each token (after range expansion) is tried as a group name first.
+		// If no nodes match that group, it is tried as a node name.
+		// This means "compute,control" selects both groups, "compute,node5"
+		// selects the compute group plus node5, and "node3-node5" selects
+		// a range of nodes. Nodes that appear in multiple matched groups are
+		// deduplicated so they only run once.
+		seen := make(map[string]bool)
+		for _, token := range expandList(selector) {
+			// Try as group name.
+			var groupMatches []Node
 			for _, n := range inv.Nodes {
-				if slices.Contains(n.Groups, selector) {
-					candidates = append(candidates, n)
+				if slices.Contains(n.Groups, token) {
+					groupMatches = append(groupMatches, n)
 				}
 			}
-			if len(candidates) == 0 {
-				for _, n := range inv.Nodes {
-					if n.Name == selector {
+			if len(groupMatches) > 0 {
+				for _, n := range groupMatches {
+					if !seen[n.Name] {
+						seen[n.Name] = true
 						candidates = append(candidates, n)
 					}
 				}
+				continue
 			}
-		} else {
-			// Multiple names, commas, or a range — treat as explicit node list.
-			wanted := make(map[string]bool, len(expanded))
-			for _, name := range expanded {
-				wanted[name] = true
-			}
+			// Not a group — try as an exact node name.
 			for _, n := range inv.Nodes {
-				if wanted[n.Name] {
+				if n.Name == token && !seen[n.Name] {
+					seen[n.Name] = true
 					candidates = append(candidates, n)
 				}
 			}
