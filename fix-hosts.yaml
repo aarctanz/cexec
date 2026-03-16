@@ -1,6 +1,5 @@
 steps:
-  - name: "write /etc/hosts"
+  - name: "overwrite /etc/hosts from master"
     roles: [compute]
     sudo: true
-    command: >-
-      bash -c 'printf "127.0.0.1 localhost\n172.16.12.90    master\n172.16.12.162   node1\n172.16.12.33    node2\n172.16.12.189    node3\n" > /etc/hosts'
+    command: "echo '{{hosts_content_b64}}' | base64 -d > /etc/hosts"

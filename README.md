@@ -94,7 +94,7 @@ Tag steps with `roles: [control]` to run only on the master node, or `roles: [co
 Completed steps are tracked by a SHA256 hash of `(nodeName, stepName, command)`. Re-running the playbook skips steps that already succeeded. Change the command and the hash changes, so the step re-runs automatically. No stale skips.
 
 ### Template Variables
-Use `{{master_pubkey}}` and `{{hosts_sync_cmds}}` in your playbook commands. They are expanded at runtime with the actual SSH public key and hosts-sync shell commands.
+Use `{{master_pubkey}}`, `{{hosts_sync_cmds}}`, and `{{hosts_content_b64}}` in your playbook commands. They are expanded at runtime — the master's SSH public key, per-entry idempotent hosts-sync commands, and a base64-encoded full copy of master's `/etc/hosts` for complete overwrites.
 
 ### Auto-Inventory from /etc/hosts
 Point `cexec` at your `/etc/hosts` file and it automatically discovers all nodes matching the naming pattern (`master`, `node1`, `node2`, ...). No manual inventory YAML required.
@@ -151,17 +151,20 @@ cexec/
 │   ├── playbook/
 │   │   └── playbook.go          # YAML playbook loader and validator
 │   ├── inventory/
-│   │   └── inventory.go         # Node struct, YAML loader, node selector
+│   │   └── inventory.go         # Node struct, YAML loader, node selector, MergeGroups
 │   ├── hosts/
 │   │   └── hosts.go             # /etc/hosts parser → auto inventory builder
 │   ├── state/
 │   │   └── state.go             # Hash-based step completion cache (SHA256)
 │   ├── logging/
-│   │   └── logger.go            # JSON run logs, summary counters, output formatting
+│   │   └── logger.go            # JSON run logs, summary counters, stdout capture
 │   └── errors/
 │       └── classify.go          # Error classifier (auth failure, timeout, DNS, etc.)
 ├── hpc-setup.yaml               # Example playbook: full Beowulf HPC cluster setup
-├── inventory.yaml               # Example manual inventory file (optional)
+├── fix-hosts.yaml               # Example playbook: overwrite /etc/hosts on all compute nodes
+├── push-ssh-key.yaml            # Example playbook: push master's SSH key to all nodes
+├── add-hpc-user.yaml            # Example playbook: create hpc user on nodes with a different OS user
+├── inventory.yaml               # Node list with group metadata (auto-maintained by cexec)
 ├── cluster.env.example          # Template config file — copy to cluster.env and fill in
 ├── go.mod
 └── go.sum
@@ -338,8 +341,16 @@ nano cluster.env
 ```bash
 # cluster.env
 
-# SSH password for all nodes (used as fallback if SSH key auth fails)
+# Global fallback password — used for SSH login and sudo when no per-user
+# password matches. CLUSTER_USER_PASSWORDS takes priority over this.
 CLUSTER_PASSWORD=yourpassword
+
+# Per-user passwords: user1:pass1,user2:pass2
+# Used for both SSH login AND sudo. Higher priority than CLUSTER_PASSWORD.
+# Useful when nodes have different usernames (e.g. migration: some nodes have
+# user "lab1", others already have user "hpc").
+# Example: CLUSTER_USER_PASSWORDS=hpc:mypassword,lab1:lab1pass
+CLUSTER_USER_PASSWORDS=hpc:yourpassword
 
 # Path to /etc/hosts (for auto-inventory mode — discovers nodes automatically)
 CLUSTER_HOSTS_FILE=/etc/hosts
@@ -439,7 +450,15 @@ cexec handles SSH authentication automatically. Here is the order it tries:
 
 1. **SSH key — `~/.ssh/id_ed25519`** (preferred — modern, fast, secure)
 2. **SSH key — `~/.ssh/id_rsa`** (fallback if ed25519 key is not found)
-3. **Password from `CLUSTER_PASSWORD`** in `cluster.env`
+3. **Password** — resolved per-node using this priority:
+
+   | Priority | Source | When it applies |
+   |---|---|---|
+   | 1 (highest) | Per-node env var (e.g. `export node5=secret`) | Override for a specific node |
+   | 2 | `CLUSTER_USER_PASSWORDS=user:pass,...` | Per-username mapping; covers both SSH login and `sudo` |
+   | 3 | `CLUSTER_PASSWORD` | Single global fallback for all nodes |
+
+   `CLUSTER_USER_PASSWORDS` applies to **both** SSH login and `sudo` — the same password used to log in is also used for `sudo -S`. You do not need `CLUSTER_PASSWORD` at all if every user in your cluster has an entry in `CLUSTER_USER_PASSWORDS`.
 
 ### First-Time Setup (Before SSH Keys Are Distributed)
 
@@ -744,17 +763,38 @@ After this step runs on all nodes, the master can SSH into every node without a 
 
 ### `{{hosts_sync_cmds}}`
 
-**Expands to:** A shell command (or series of piped commands) that pushes the cluster's `/etc/hosts` entries from the master to every compute node.
+**Expands to:** A series of `grep ... || echo >> /etc/hosts` idempotency commands — one per cluster entry in master's `/etc/hosts`. Each command checks if an entry already exists on the node before appending it, so re-running is safe.
 
 **Example use:**
 
 ```yaml
 - name: "sync /etc/hosts to all nodes"
   command: "{{hosts_sync_cmds}}"
-  roles: [control]
+  sudo: true
 ```
 
 This ensures every node in the cluster can resolve every other node by hostname — which is required for MPI, NFS mounts, and inter-node SSH.
+
+**When the hash changes:** Adding a new node to master's `/etc/hosts` changes the expanded value of `{{hosts_sync_cmds}}`, which changes the SHA256 hash of this step, which means cexec automatically re-runs the sync step on all nodes next time you run the playbook. No manual cache clearing needed.
+
+### `{{hosts_content_b64}}`
+
+**Expands to:** The full content of master's `/etc/hosts`, base64-encoded.
+
+Use this when you want to **completely overwrite** `/etc/hosts` on a node (rather than just appending missing entries). This is useful for repairing nodes that ended up with a corrupted or empty `/etc/hosts`.
+
+**Example use:**
+
+```yaml
+- name: "overwrite /etc/hosts from master"
+  command: "echo '{{hosts_content_b64}}' | base64 -d > /etc/hosts"
+  sudo: true
+  roles: [compute]
+```
+
+**Why base64?** `/etc/hosts` can contain tabs, multi-space alignment, and lines that would break shell quoting if passed directly as a string argument. Base64 encoding avoids all quoting and escaping issues entirely — the encoded blob is a single printable string with no special characters.
+
+**When the hash changes:** Any change to master's `/etc/hosts` changes this value, triggering an automatic re-run of the step.
 
 ---
 
@@ -1056,6 +1096,24 @@ Yes. The `.gitignore` in this repo includes `cluster.env`. The file `cluster.env
 ### Can I use cexec with nodes that have different SSH users or ports?
 
 Yes — in `inventory.yaml`, each node entry has its own `user` and `port` fields. When using auto-inventory from `/etc/hosts`, all discovered nodes use the same user (from `CLUSTER_USER` or `--hosts-user`) and port 22. For mixed environments, use `inventory.yaml`.
+
+### I have nodes with two different usernames (e.g. some have "lab1", some have "hpc"). How do I handle passwords?
+
+Set `CLUSTER_USER_PASSWORDS` in `cluster.env`:
+
+```bash
+CLUSTER_USER_PASSWORDS=hpc:hpcpassword,lab1:lab1password
+```
+
+cexec matches each node's SSH username against this map and uses the corresponding password — for both SSH login and `sudo`. No need to set `CLUSTER_PASSWORD` separately. This priority order applies: node-name env var → `CLUSTER_USER_PASSWORDS` → `CLUSTER_PASSWORD`.
+
+### My sudo commands fail even though my SSH login works. Why?
+
+This usually means the sudo password is not being passed correctly. Check:
+
+1. Is `CLUSTER_USER_PASSWORDS=youruser:yourpassword` set in `cluster.env`? This is the recommended way — it supplies both the SSH and sudo password.
+2. Is `CLUSTER_PASSWORD` set as a fallback? It is only used if `CLUSTER_USER_PASSWORDS` has no entry for that user.
+3. Does your user actually have sudo rights on that node? Test manually: `ssh user@node "echo yourpassword | sudo -S whoami"` — should print `root`.
 
 ### The playbook has 30 steps. Can I start from step 15?
 

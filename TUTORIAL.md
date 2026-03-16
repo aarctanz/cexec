@@ -136,15 +136,20 @@ cp cluster.env.example cluster.env
 Now edit `cluster.env`:
 
 ```bash
-CLUSTER_PASSWORD=yourpassword
 CLUSTER_HOSTS_FILE=/etc/hosts
 CLUSTER_USER=ubuntu
 CLUSTER_PLAYBOOK=hpc-setup.yaml
+
+# For a uniform cluster (one username, one password):
+CLUSTER_PASSWORD=yourpassword
+
+# For mixed usernames, use this instead (covers both SSH login and sudo):
+# CLUSTER_USER_PASSWORDS=ubuntu:yourpassword,lab1:lab1password
 ```
 
 **What each field does:**
 
-- `CLUSTER_PASSWORD` — the SSH/sudo password for all nodes. For per-node passwords, see the Tips section.
+- `CLUSTER_PASSWORD` — the SSH and sudo password for all nodes. Use `CLUSTER_USER_PASSWORDS` instead if your nodes have different usernames or passwords.
 - `CLUSTER_HOSTS_FILE` — the file cexec parses for hostnames and IPs. Lines with `master` become the `control` group; lines with `node1`, `node2`, etc. become the `compute` group.
 - `CLUSTER_USER` — the SSH username on all nodes.
 - `CLUSTER_PLAYBOOK` — the default playbook file (you can override this with `--playbook`).
@@ -663,7 +668,7 @@ steps:
 
 **`command`** — The shell command to run. This is passed to `/bin/sh -c` on the remote node. You can use `&&`, pipes, redirects, variables — anything your remote shell supports.
 
-**`sudo`** — Set to `true` to prefix the command with `sudo`. This uses the password from `CLUSTER_PASSWORD`. Without this, commands run as `CLUSTER_USER`. If your command needs root, you must set this.
+**`sudo`** — Set to `true` to prefix the command with `sudo`. The sudo password comes from `CLUSTER_USER_PASSWORDS` (matched by the node's username) or `CLUSTER_PASSWORD` as a fallback. Without this, commands run as `CLUSTER_USER`. If your command needs root, you must set this.
 
 **`roles`** — A list of groups. `[control]` means the step only runs on the master node. `[compute]` means it only runs on worker nodes. Omit `roles` entirely to run on all nodes.
 
@@ -809,16 +814,38 @@ The `depends_on` here includes `configure-nfs-exports` (a control-group step). W
 
 ### Steps That Sync Across Node Boundaries
 
-The `{{hosts_sync_cmds}}` template variable expands to shell commands that copy `/etc/hosts` entries from master to each compute node. Use it for steps that need to propagate master's configuration to workers:
+The `{{hosts_sync_cmds}}` template variable expands to a series of idempotent `grep ... || echo >> /etc/hosts` commands — one per cluster entry in master's `/etc/hosts`. Each command checks whether an entry already exists on the target node before appending it:
 
 ```yaml
 - name: "sync-hosts"
   command: "{{hosts_sync_cmds}}"
   sudo: true
-  roles: [control]
 ```
 
-cexec expands `{{hosts_sync_cmds}}` into the actual `ssh` or `scp` commands needed to push `/etc/hosts` entries to each node.
+This incrementally adds any missing entries to each node's `/etc/hosts`. It is safe to re-run: existing entries are never duplicated.
+
+When you add a new node to master's `/etc/hosts`, the expanded value of `{{hosts_sync_cmds}}` changes — which changes the SHA256 hash of this step — so cexec automatically re-runs the sync on all nodes next time. No manual cache clearing needed.
+
+### Fully Overwriting /etc/hosts with {{hosts_content_b64}}
+
+If a node's `/etc/hosts` is corrupted or was accidentally emptied, use `{{hosts_content_b64}}` to do a full overwrite:
+
+```yaml
+- name: "overwrite /etc/hosts from master"
+  command: "echo '{{hosts_content_b64}}' | base64 -d > /etc/hosts"
+  sudo: true
+  roles: [compute]
+```
+
+`{{hosts_content_b64}}` expands to the full content of master's `/etc/hosts`, base64-encoded. This completely replaces the node's `/etc/hosts` with master's copy — a hard reset, not an incremental sync.
+
+**Which one to use?**
+
+| Scenario | Use |
+|---|---|
+| Adding new nodes, keeping existing entries | `{{hosts_sync_cmds}}` |
+| Node's `/etc/hosts` is empty or corrupted | `{{hosts_content_b64}}` |
+| Want master's exact `/etc/hosts` on every node | `{{hosts_content_b64}}` |
 
 ### Using the Master Public Key
 
@@ -1276,18 +1303,29 @@ Package downloads, external API calls, and NFS mounts can be intermittently flak
 
 Each failed step is retried up to 3 times before being marked as definitively failed. The retry count is not burned through on cached steps.
 
-### Per-node Passwords
+### Mixed-User Clusters (Different Usernames on Different Nodes)
 
-If different nodes have different passwords, set environment variables named after each node:
+When nodes have different SSH usernames — common during migrations — use `CLUSTER_USER_PASSWORDS` in `cluster.env`:
 
 ```bash
-export master=password_for_master
-export node1=password_for_node1
-export node2=password_for_node2
+# cluster.env
+CLUSTER_USER_PASSWORDS=hpc:hpcpassword,lab1:lab1password
+```
+
+cexec matches each node's SSH `user` field against this map and uses the corresponding password for **both** SSH login and `sudo`. You do not need to touch `CLUSTER_PASSWORD` at all if every username in your cluster is listed here.
+
+If some nodes also have inventory entries with different `user` fields (e.g. some nodes say `user: hpc`, others say `user: lab1`), the map automatically routes the right password to each node.
+
+### Per-node Password Override
+
+For a one-off override of a specific node's password, export an environment variable named after the node:
+
+```bash
+export node3=special_password
 ./cexec --playbook hpc-setup.yaml
 ```
 
-cexec checks for an environment variable matching the node name before falling back to `CLUSTER_PASSWORD`.
+This takes the highest priority — overrides both `CLUSTER_USER_PASSWORDS` and `CLUSTER_PASSWORD` for that node. Useful for testing a single node without changing `cluster.env`.
 
 ### Inspect the Cache
 
@@ -1424,22 +1462,31 @@ grep node1 /etc/hosts
 
 ---
 
-### "sudo: a password is required"
+### "sudo: a password is required" / "Sorry, try again"
 
-**Cause:** The step uses `sudo: true` but either `CLUSTER_PASSWORD` is not set or the remote user is not allowed to use sudo with a password.
+**Cause:** The step uses `sudo: true` but the sudo password is not reaching the node. This happens when:
+- Neither `CLUSTER_USER_PASSWORDS` nor `CLUSTER_PASSWORD` is set in `cluster.env`
+- The password in `cluster.env` is wrong for that node
+- SSH key auth succeeded (so login worked) but the sudo password source was empty
 
 **Fix:**
 ```bash
-# Option 1: Set the password in cluster.env
+# Recommended: set per-user passwords in cluster.env
+# These apply to BOTH SSH login and sudo
+CLUSTER_USER_PASSWORDS=hpc:yourpassword,lab1:lab1password
+
+# Alternative: set a single global fallback
 CLUSTER_PASSWORD=yourpassword
 
-# Option 2: Configure passwordless sudo on remote nodes
-# Add this to /etc/sudoers on each node:
-ubuntu ALL=(ALL) NOPASSWD:ALL
+# Verify the password works manually by SSH-ing in and testing sudo:
+ssh hpc@node1 "echo yourpassword | sudo -S whoami"
+# Expected output: root
 
-# Option 3: Add the user to the sudo group (Ubuntu)
-sudo usermod -aG sudo ubuntu
+# If you prefer passwordless sudo, add NOPASSWD to /etc/sudoers on each node:
+# hpc ALL=(ALL) NOPASSWD:ALL
 ```
+
+**Important:** `CLUSTER_USER_PASSWORDS` has higher priority than `CLUSTER_PASSWORD` and applies to sudo as well as SSH login. If your nodes use SSH key auth for login, cexec still needs the password for `sudo` — make sure it is set in `cluster.env`.
 
 ---
 

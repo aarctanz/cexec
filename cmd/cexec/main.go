@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -241,6 +242,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build node→password map for sudo (same resolved passwords used for SSH login).
+	cmdNodePassMap := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		if n.Password != "" {
+			cmdNodePassMap[n.Name] = n.Password
+		}
+	}
+
 	opts := executor.Options{
 		Command:        cmd,
 		Sudo:           *sudo,
@@ -253,10 +262,10 @@ func main() {
 			if p := os.Getenv(nodeName); p != "" {
 				return p
 			}
-			if clusterPassword != "" {
-				return clusterPassword
+			if p, ok := cmdNodePassMap[nodeName]; ok {
+				return p
 			}
-			return os.Getenv("CLUSTER_SUDO_PASS")
+			return clusterPassword
 		},
 	}
 
@@ -402,14 +411,24 @@ func runPlaybook(
 		os.Exit(1)
 	}
 
+	// Build a node→password map from the already-resolved node list so that
+	// CLUSTER_USER_PASSWORDS (and other per-node password sources) also supply
+	// the sudo password — not just the SSH login password.
+	nodePassMap := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		if n.Password != "" {
+			nodePassMap[n.Name] = n.Password
+		}
+	}
+
 	sudoPassFn := func(nodeName string) string {
 		if p := os.Getenv(nodeName); p != "" {
 			return p
 		}
-		if clusterPassword != "" {
-			return clusterPassword
+		if p, ok := nodePassMap[nodeName]; ok {
+			return p
 		}
-		return os.Getenv("CLUSTER_SUDO_PASS")
+		return clusterPassword
 	}
 
 	// Build template variables available to all step commands.
@@ -430,6 +449,15 @@ func runPlaybook(
 	hostsSource := clusterHostsFile(pbPath, autoHostsVal)
 	if hostsSource != "" {
 		templateVars["hosts_sync_cmds"] = buildHostsSyncCmds(hostsSource)
+		// {{hosts_content_b64}} — full content of master's hosts file, base64-encoded.
+		// Use in playbooks to completely overwrite /etc/hosts on target nodes:
+		//   command: "echo '{{hosts_content_b64}}' | base64 -d | sudo tee /etc/hosts"
+		// base64 avoids all quoting/escaping issues with tabs, spaces, and newlines.
+		// When master's /etc/hosts changes, this value changes → hash changes →
+		// step re-runs automatically on next playbook execution.
+		if data, err := os.ReadFile(hostsSource); err == nil {
+			templateVars["hosts_content_b64"] = base64.StdEncoding.EncodeToString(data)
+		}
 	}
 
 	fmt.Printf("Playbook : %s  (%d steps, %d nodes)\n", pbPath, len(pb.Steps), len(nodes))
