@@ -474,6 +474,21 @@ ssh-keygen -t ed25519 -C "cluster-master"
 
 ## Usage Examples
 
+### The `--` Separator
+
+`--` is a POSIX convention that tells the flag parser "stop reading flags — everything after this is the command". Flags can appear in **any order** before `--`. Everything after `--` is joined and passed verbatim to the remote shell.
+
+```bash
+./cexec --nodes compute --sudo -- apt-get update
+#        ^^^^^^^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^
+#        flags (any order)         command
+```
+
+You can also swap flag order freely:
+```bash
+./cexec --sudo --nodes compute -- apt-get update   # same result
+```
+
 ### Run a Single Command on All Nodes
 
 ```bash
@@ -931,8 +946,10 @@ Example log entry for a single node's step:
 | Flag | Default | Description |
 |---|---|---|
 | `--env-file` | `cluster.env` | Path to the env config file |
-| `--log-dir` | `logs` | Directory to write JSON log files into |
+| `--log-dir` | `logs` | Directory to write JSON run logs into (named `run_<timestamp>_<id>.json`) |
 | `--quiet` | `false` | Suppress per-node output; print only the final summary |
+| `--stdout` | `false` | Save full stdout from every node to `--stdout-dir/<timestamp>/<node>.log` |
+| `--stdout-dir` | `cexec_stdout` | Directory for per-node stdout files (only used when `--stdout` is set) |
 
 ---
 

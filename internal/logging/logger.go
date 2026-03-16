@@ -64,6 +64,17 @@ func BuildSummary(logs []NodeLog) Summary {
 	return s
 }
 
+// WriteStdout writes per-node stdout files into dir/<runTS>/<nodename>.log.
+// content is the full stdout string for that node (may span multiple steps).
+// Called only when --stdout is set.
+func WriteStdout(dir, runTS, nodeName, content string) error {
+	runDir := filepath.Join(dir, runTS)
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return fmt.Errorf("creating stdout dir: %w", err)
+	}
+	return os.WriteFile(filepath.Join(runDir, nodeName+".log"), []byte(content), 0o644)
+}
+
 // WriteLog writes the run log as a JSON file under logDir.
 func WriteLog(logDir string, rl RunLog) (string, error) {
 	if err := os.MkdirAll(logDir, 0o755); err != nil {

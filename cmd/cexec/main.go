@@ -67,6 +67,8 @@ func main() {
 	playbookPath  := flag.String("playbook", "", "Path to YAML playbook file (runs multi-step setup)")
 	stateFile     := flag.String("state-file", envDefault("CLUSTER_STATE_FILE", ".cexec_state.json"), "Path to state file for skip-if-done tracking")
 	forceRun      := flag.Bool("force", false, "Ignore cached state and re-run all steps")
+	saveStdout    := flag.Bool("stdout", false, "Save full stdout from every node to --stdout-dir/<timestamp>/<node>.log")
+	stdoutDir     := flag.String("stdout-dir", "cexec_stdout", "Directory for per-node stdout logs (used with --stdout)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: cexec [flags] -- <command>\n")
@@ -74,9 +76,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\ncluster.env keys (loaded automatically if present):\n")
-		fmt.Fprintf(os.Stderr, "  CLUSTER_PASSWORD    SSH + sudo password for all nodes\n")
-		fmt.Fprintf(os.Stderr, "  CLUSTER_HOSTS_FILE  Primary IP source (e.g. /etc/hosts); syncs new nodes into inventory.yaml\n")
-		fmt.Fprintf(os.Stderr, "  CLUSTER_USER        SSH user (default: hpc)\n")
+		fmt.Fprintf(os.Stderr, "  CLUSTER_PASSWORD         SSH + sudo password fallback for all nodes\n")
+		fmt.Fprintf(os.Stderr, "  CLUSTER_USER_PASSWORDS   Per-user passwords: user1:pass1,user2:pass2\n")
+		fmt.Fprintf(os.Stderr, "  CLUSTER_HOSTS_FILE       Primary IP source (e.g. /etc/hosts); syncs new nodes into inventory.yaml\n")
+		fmt.Fprintf(os.Stderr, "  CLUSTER_USER             SSH user (default: hpc)\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_PLAYBOOK    Default playbook path\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_LOG_DIR     Log directory (default: logs)\n")
 		fmt.Fprintf(os.Stderr, "  CLUSTER_STATE_FILE  State file path (default: .cexec_state.json)\n")
@@ -199,9 +202,13 @@ func main() {
 	}
 
 	// Inject passwords at runtime — never stored in inventory files.
+	// Priority: node-name env var > CLUSTER_USER_PASSWORDS map > CLUSTER_PASSWORD.
+	userPasswords := parseUserPasswords(os.Getenv("CLUSTER_USER_PASSWORDS"))
 	for i := range inv.Nodes {
 		n := &inv.Nodes[i]
 		if p := os.Getenv(n.Name); p != "" {
+			n.Password = p
+		} else if p, ok := userPasswords[n.User]; ok {
 			n.Password = p
 		} else if clusterPassword != "" {
 			n.Password = clusterPassword
@@ -222,7 +229,7 @@ func main() {
 		}
 		runPlaybook(ctx, nodes, *playbookPath, *stateFile, *forceRun, *logDir,
 			*timeout, *concurrency, *retries, *backoffBase, *backoffFixed, *quiet,
-			clusterPassword, *autoHosts)
+			clusterPassword, *autoHosts, *saveStdout, *stdoutDir)
 		return
 	}
 
@@ -293,6 +300,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: could not write log: %v\n", err)
 	} else {
 		fmt.Printf("\nLog written: %s\n", logPath)
+	}
+
+	if *saveStdout {
+		runTS := runStart.Format("20060102T150405")
+		for _, nl := range nodeLogs {
+			if err := logging.WriteStdout(*stdoutDir, runTS, nl.Node, nl.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not write stdout for %s: %v\n", nl.Node, err)
+			}
+		}
+		fmt.Printf("Stdout saved: %s/%s/\n", *stdoutDir, runTS)
 	}
 
 	if summary.Failed > 0 || summary.Unreachable > 0 || summary.TimedOut > 0 {
@@ -370,6 +387,8 @@ func runPlaybook(
 	quiet bool,
 	clusterPassword string,
 	autoHostsVal string,
+	saveStdout bool,
+	stdoutDir string,
 ) {
 	pb, err := playbook.Load(pbPath)
 	if err != nil {
@@ -529,6 +548,10 @@ func runPlaybook(
 	stepLogs := make(map[int][]logging.NodeLog)
 	stepStart := make(map[int]time.Time)
 
+	// Per-node stdout accumulator (used when --stdout is set).
+	// Each entry is the full stdout for that node across all steps.
+	nodeStdout := make(map[string]strings.Builder)
+
 	for r := range results {
 		if r.skipped {
 			if !quiet {
@@ -542,6 +565,12 @@ func runPlaybook(
 			stepStart[r.stepIdx] = r.nl.Start
 		}
 		stepLogs[r.stepIdx] = append(stepLogs[r.stepIdx], r.nl)
+
+		if saveStdout && r.nl.Stdout != "" {
+			sb := nodeStdout[r.node]
+			sb.WriteString(fmt.Sprintf("=== [%s] ===\n%s\n", r.stepName, r.nl.Stdout))
+			nodeStdout[r.node] = sb
+		}
 
 		mu.Lock()
 		if r.nl.Success {
@@ -609,6 +638,17 @@ func runPlaybook(
 		}
 	}
 
+	// ── Write stdout files if --stdout is set ─────────────────────────────────
+	if saveStdout && len(nodeStdout) > 0 {
+		runTS := time.Now().Format("20060102T150405")
+		for node, sb := range nodeStdout {
+			if err := logging.WriteStdout(stdoutDir, runTS, node, sb.String()); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not write stdout for %s: %v\n", node, err)
+			}
+		}
+		fmt.Printf("\nStdout saved: %s/%s/\n", stdoutDir, runTS)
+	}
+
 	// ── Final summary ──────────────────────────────────────────────────────────
 	fmt.Println()
 	fmt.Println(strings.Repeat("═", 60))
@@ -630,7 +670,7 @@ func runPlaybook(
 }
 
 func generateRunID() string {
-	b := make([]byte, 8)
+	b := make([]byte, 3) // 3 bytes = 6 hex chars, enough to avoid same-second collisions
 	_, _ = rand.Read(b)
 	ts := time.Now().Format("20060102T150405")
 	return fmt.Sprintf("%s_%s", ts, hex.EncodeToString(b))
@@ -754,6 +794,23 @@ func loadEnvFile(path string) error {
 		}
 	}
 	return nil
+}
+
+// parseUserPasswords parses CLUSTER_USER_PASSWORDS=user1:pass1,user2:pass2
+// into a map of username → password.
+func parseUserPasswords(s string) map[string]string {
+	m := make(map[string]string)
+	if s == "" {
+		return m
+	}
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		k, v, ok := strings.Cut(pair, ":")
+		if ok {
+			m[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return m
 }
 
 // envDefault returns the env var value or fallback if unset.

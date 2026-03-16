@@ -35,3 +35,69 @@ nodes:
     user: hpc
     port: 22
     groups: [compute]
+
+  - name: node4
+    host: 172.16.12.203
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node5
+    host: 172.16.12.105
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node6
+    host: 172.16.12.17
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node7
+    host: 172.16.12.82
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node8
+    host: 172.16.12.63
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node9
+    host: 172.16.12.245
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node10
+    host: 172.16.12.71
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node11
+    host: 172.16.12.64
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node12
+    host: 172.16.12.69
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node13
+    host: 172.16.12.62
+    user: hpc
+    port: 22
+    groups: [compute]
+
+  - name: node14
+    host: 172.16.12.60
+    user: hpc
+    port: 22
+    groups: [compute]

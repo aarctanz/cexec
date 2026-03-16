@@ -1,0 +1,10 @@
+steps:
+  - name: "create hpc user"
+    sudo: true
+    command: >-
+      id hpc 2>/dev/null
+      && echo "hpc already exists, skipping"
+      || (useradd -m -s /bin/bash hpc
+      && echo 'hpc:spring' | chpasswd
+      && usermod -aG sudo hpc
+      && echo "hpc user created")
